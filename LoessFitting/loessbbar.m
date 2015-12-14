@@ -1,0 +1,752 @@
+% LOESSBBAR:   loess with bogussing, TAR, BAR, gapfill by projection
+%              from adjacent levels.
+%  loess map at xi,yi from standard level data [xd,yd,dd] using q nearest casts 
+%  with bogusing and with data selection and weights influenced by bathymetry,
+%  and using selection with estimated normalisation radius followed by reselection. 
+%  Barriers system to modify distance function.  Coefficient constraint, or 
+%  tapering, optionally applied to different fit functions.
+%
+% INPUT  (use [] to activate default, where defaults are listed below)
+% xd:   longitudes of data (vector)
+% yd:   latitudes of data (vector)
+% td:   time of data, as julian day-of-year (1-366) (vector)  [or
+%       days since base year, if fns(3) or fns(4) ~= 0.]
+% depd: bottom depths at data locations
+% dd:   data: (including that projected from adjacent levels)
+% dw:   weights of data (downweight if projected from adjacent levels, presquared)
+% xi:   longitude(s) at mappoints (ie points at which mapping is required) 
+% yi:   latitude(s) at mappoints
+% depi:  bottom depth at mappoints
+% pold:  polygon of residence of each cast
+% poli:  polygon of residence of each mappoint
+% rmin:  minimum radius to be used (overrides q if rq too small).
+% xwgt:  zonal stretch   [def 1]
+% config:   struct var with the following fields:
+%   q1: number of points to use if obtained at r=0 (infinite sample density)
+%   q2:  number of points to use at maximum radius (when low sample density) 
+%   rmax: maximum radius to be used (overrides q if rq too large).
+%   fns:  [1 n]  n=1:annual  n=2:semian  n=3:T  n=4:T^2  {def [0 0 0 0]}
+%   bthy: 0=do not use TAR; 0< amount of TAR (usually between 0 and 1).
+%   bogus:  0=off  1=Spatial  2,3,4=Spatial&Temporal -1,2,3,4=bogus=0 [def 1]
+%   smw:  1=return sum of weights  [def 0]
+%   noextrap:  1 = do not map if purely extrapolating (set nq=-4) [default 1]
+%              3,4 =  "  "   "   " mostly   "     "     (set nq=-5,-6)
+%               (-4 uses fancy & expensive test)
+%
+% OUTPUT
+%   vo   Structure with the following fields (as required)
+% mn: estimate of time mean at xi,yi
+% rq: distance (km) from xi,yi to the most distant (nq'th) data point
+% nq: number of points used in estimate (Also 0,-3,-4 where bad data distrib)
+% an: complex annual time component
+% sa: complex semi-annual time component
+% swgt: sum-of-weights
+% tco: coefficient of linear T fit
+% t2co: coefficient of T^2 fit
+%
+% NOTE: Use of the annual and semi-annual components: 
+%    mn(t) = mn + real(an*exp(-i*2*pi/T*t)) ...
+%            + real(sa*exp(-i*4*pi/T*t));  T = 366;
+%       Use of quadratic T fit as well:
+%    mn(t) = mn + real(an*exp(-i*2*pi/T*t)) + real(sa*exp(-i*4*pi/T*t)) ...
+%            tco*(t-TB) + t2co*(t-TB).^2;       T = 366, TB = 1960 say;
+%
+% AUTHOR: Jeff Dunn   CSIRO Marine Research
+%
+% USAGE: vo = loessbbar(...
+%   xd,yd,td,depd,dd,dw,xi,yi,depi,pold,poli,rmin,xwgt,config)
+
+function vo = loessbbar(...
+    xd,yd,td,depd,dd,dw,xi,yi,depi,pold,poli,rmin,xwgt,config)
+
+% CALLS:  varsort   maxjd  saga/iscross
+%
+% This implementation of the loess method follows Cleveland, W. S. and
+% S. J. Devlin, "Locally weighted regression: An approach to regression
+% analysis by local fitting," J. Am. Stat. Assoc., vol 83, 596--610, 1988
+% but with the harmonic time component added by John Wilkin. 
+%
+% From: loess3dbbar.m,v 1.7 2000/04/14
+% $Id: loessbbar.m,v 1.6 2003/08/07 01:06:50 dun216 Exp dun216 $
+%
+% MODS: 30/3/05  Collect control arguments into "config"
+%       15/12/05 nq>3*q1 and nq=-3,-4 tests, and some restructuring
+%       10/7/06  drop spatial quadratics for low-nq fits
+%       1/9/08   nq=-5 test, and bogus=-2,-3 treatment
+
+global  P_Pmindis  P_Pilines  P_Pg1  P_Pg2  P_Pr2  P_Pchoke
+global  P_Gate P_lgap  P_line
+global  lstxw pp_xw_init ppname
+global  grab_all
+
+if ~isempty(grab_all)
+   grab_all = 1;
+   global c w rb bog r xvq yvq dwq rbq dq tvq bdvq
+end
+
+if isempty(lstxw)
+   lstxw = -1;
+end
+
+% Work in kilometres on surface of sphere (111.19 = Rearth*pi/180), except
+% this is distorted by zonal stretching.
+dk = 111.19;    % degrees->km
+
+vlarge = 100000;
+
+
+alpha = 4;    % Controls rate of inshore cutout
+beta = .01;   % Controls rate of offshore cutout
+
+noextrap = 1;
+smw = 0;
+bogus = 1;
+bthy = 1;
+fns = [0 0 0 0];
+rmax = 10e10;
+wgtest = 1;
+
+if nargin<14 | isempty(config)
+   disp('Sorry, you need to provide argument "config", a struct variable.') 
+   error('Eg:  config.q1=400; config.q2=100; config.fns=[];  etc...')
+end
+
+q1 = config.q1;
+q2 = config.q2;
+
+if isfield(config,'noextrap') && ~isempty(config.noextrap)
+   noextrap = config.noextrap;
+end
+if ~isempty(config.smw)
+   smw = config.smw;
+end
+if ~isempty(config.bogus)
+   bogus = config.bogus;
+end
+if ~isempty(config.bthy)
+   bthy = config.bthy;
+end
+if  isfield(config,'wgtest') && ~isempty(config.wgtest)
+   wgtest = config.wgtest;
+end
+if ~isempty(config.fns)
+   fns = config.fns;   
+   if length(fns)==1 & fns==2
+      fns = [1 1 0 0];
+   elseif length(fns)<4      
+      fns(4) = 0;
+   end
+end
+if fns(3)>0 || fns(4)>0
+   % td will be time in days since a base year. We still need td to be 
+   % day-of-year for fitting fns(1) and (2), but also make new variable Td
+   % which is time in years, so trend fit is in terms of years.   
+   Td = td/365.25;      
+   td = time2doy(td);
+end
+if ~isempty(config.rmax)
+   rmax = config.rmax;
+end
+if noextrap==4
+   % Set up for fancy extrapolation testing
+   pinc = -pi:(pi/8):pi;
+   fwgt = [.1 .8 1 1 1 1 1 .8 .1];
+end
+
+if isfield(config,'constraint') & ~isempty(config.constraint)
+   constrained = 1;
+%   si = config.constraint;
+%   tmp = si([1 2 2 3 4 4]);
+%   if fns(1)
+%      tmp = [tmp si([5 5])];
+%   end
+%   if fns(2)
+%      tmp = [tmp si([6 6])];
+%   end
+%   if fns(3)
+%      tmp = [tmp si(7)];
+%   end
+%   if fns(4)
+%      tmp = [tmp si(8)];
+%   end      
+%   Si = diag(1./tmp');
+   tmp = config.constraint;
+   Si = diag(1./tmp(:));
+else
+   constrained = 0;
+   Si = [];
+end
+
+if nargin<13 | isempty(xwgt)
+   xwgt = ones(size(xi));
+end
+if rmax<=max(rmin(:))
+   error(['rmax(' num2str(rmax) '<=rmin(' num2str(max(rmin(:))) ' !!']);
+end
+
+T = 366; 	% rough: dayofyear ranges from 0->366 in leap years
+
+% Set up for temporal bogussing
+if bogus > 1 | bogus==-4
+   tmon = (15:30.5:350.5)';
+   cos_tm = cos(2*pi/T*tmon);
+   sin_tm = sin(2*pi/T*tmon);
+   cos_2tm = cos(4*pi/T*tmon);
+   sin_2tm = sin(4*pi/T*tmon);
+end
+
+if fns(1)
+   cst = cos(2*pi/T*td);
+   snt = sin(2*pi/T*td);
+end
+if fns(2)
+   cs2t = cos(4*pi/T*td);
+   sn2t = sin(4*pi/T*td);
+end
+if fns(4)
+   Td2 = Td.^2;
+end
+
+% For when a radius-weighting axis rotation system is implemented:
+rotang = 0;
+if rotang~=0
+   cosrot = cos(rotang*pi/180);
+   sinrot = sin(rotang*pi/180);
+end
+
+
+% Create outputs, and define ratio of nq to use to calc mean for bogus value
+% and minimum allowable number of points to be used to evaluate a grid point.
+% (must be at least as many as the number of coefficients in matrix A). 
+% Fitting time harmonics is safe only if there are enough points, and they
+% are adequately distributed. Where they cannot be fitted,
+% the coefficients remain zero, so that evaluation of monthly values will
+% work (sort of) in absence of the harmonics. Where not z-fitting, can get
+% away with smaller values.
+%
+% near_rat is the ratio of nq to use to calc mean for bogus value
+
+tmp = repmat(NaN,size(xi));
+vo.mn = tmp;
+vo.rq = zeros(size(xi));
+vo.nq = tmp;
+if all(fns(1:4)==0)
+   near_rat = .2;   
+   minq = 8;
+elseif fns(1)
+   vo.an = tmp;
+   near_rat = .12;
+   minq = 35;
+end
+if fns(2)
+   vo.sa = tmp;
+   near_rat = .1;
+   minq = 50;
+end
+if fns(3)
+   vo.tco = tmp;
+   near_rat = .1;
+   minq = minq+10;
+end
+if fns(4)
+   vo.t2co = tmp;
+   near_rat = .1;
+   minq = minq+10;
+end
+minq = min(minq,q2);
+
+if smw>0
+   vo.swgt = zeros(size(xi));
+end
+
+
+
+if isempty(dd)
+   %### maybe do some clever reporting here ??
+   
+   % disp(['No data: ' num2str([min(xi(:)) max(xi(:)) min(yi(:)) max(yi(:))])]);
+   return
+end
+
+
+% For efficiency, pre-calc deep and shallow water cases of rbath
+if bthy
+   btmp = depd(:)';
+   rbdeep = (1 -( maxjd([zeros(size(btmp)); 1-beta*(btmp./2000)]) ...
+		  - maxjd([zeros(size(btmp)); 1-alpha*(btmp./2000)]))').^2;
+   rbshal = (1 -( maxjd([zeros(size(btmp)); 1-beta*(btmp./25)]) ...
+		  - maxjd([zeros(size(btmp)); 1-alpha*(btmp./25)]))').^2;
+end
+
+% Get an index to reorganise mappoints into order of polygons and xwgt (to
+% minimize recalculation of paths)
+[tmp,mpolyorder] = sort((poli(:)*10)+xwgt(:));
+
+mpo = -1;
+
+
+% ---- Loop over points to map (in mappoint polygon order) ------
+
+for jj=mpolyorder(:)'
+   % If xw (zonal stretch) has changed, recalc precalc-ed paths, or reload if
+   % already calc'ed.
+   if floor(xwgt(jj)*10) ~= lstxw
+      lstxw = floor(xwgt(jj)*10);
+      ixw = round(lstxw-9);
+      if pp_xw_init(ixw)
+	 load([ppname num2str(ixw)]);
+      else
+	 ppload2(xwgt(jj));
+	 save([ppname num2str(ixw)],'P_Pr2');
+	 pp_xw_init(ixw) = 1;
+      end
+   end
+   
+   % Centre coordinates on mappoint and correct for latitude.
+   xj = xi(jj);
+   yj = yi(jj);
+   cor = latcor(yj)/xwgt(jj);
+   
+   % If a new mappoint polygon, do bulk precalculations
+   if poli(jj)~=mpo
+      mpo = poli(jj);
+
+      % Find all data in polys which could possibly be used by this mp-poly
+      % Initialise r3, the precalculated distance array.
+      
+      vis = find(P_Pmindis(pold,mpo) < (rmax*xwgt(jj)));    
+
+      xv = xd(vis);
+      yv = yd(vis);
+      pov = pold(vis);
+      depv = depd(vis);
+      ddv = dd(vis);
+      dwv = dw(vis);
+      
+      % Preload dp's into g1 for cases where no gates (simple distance)
+
+      g1x = repmat(xv',3,1);
+      g1y = repmat(yv',3,1);
+      
+      chkrv = P_Pchoke(:,pov,mpo);
+
+      % okg indexes all routes (in the 3 x ndata arrays) which use gates (ie 
+      % those where g2 is non-zero).
+      % For those routes using gates , precalculate g1-dp distances, which is 
+      % r2+dist(g2-dp). Note that at this stage g1x g1y are really the dp 
+      % location, and have as yet NOTHING to do with g1!
+      % Where no gates are used, r3 is set to r2, which is preset to zero in 
+      % route 1 (ie only simple distance) and v large elsewhere (so that that
+      % non-route does not become the selected minimum route.)
+
+      r3 = P_Pr2(:,pov,mpo);
+      okr = find(r3<vlarge);
+      g1 = P_Pg1(:,pov,mpo);
+      g2 = P_Pg2(:,pov,mpo);
+      okg = ~(~g2);
+
+      if ~any(okg(:))
+	 % NO routes using gates, (hence no ilines either) so just preset 
+	 % variables appropriately
+	 ichk = [];
+	 
+      else
+	 % Note to avoid using a new variable, g1x,g1y just contain xv,yv X 3.
+	 % Get gate "penalties", but avoid adding in twice if just a single
+	 % gate route (hence g1=g2).
+	 pnlty = P_Gate(3,g1(okg))' + (g1(okg)~=g2(okg)).*P_Gate(3,g2(okg))';
+	 r3(okg) = r3(okg) + pnlty + ...
+		   dk*sqrt(((P_Gate(1,g2(okg))'-g1x(okg))*cor).^2 ...
+			   +(P_Gate(2,g2(okg))'-g1y(okg)).^2);
+
+	 % Overload g1 positions, where have gates
+	 g1x(okg) = P_Gate(1,g1(okg));
+	 g1y(okg) = P_Gate(2,g1(okg));
+	 
+	 % Removed point-gate-barrier-point capability because things were just
+	 % too complex (and it wasn't quite right)!  See loessbbar.m.111000 11/10/00
+	 
+         % Identify i-lines
+	 il = P_Pilines(pov,mpo); 
+	 ichk = find(il);
+	 il = il(ichk);
+      end
+      
+   end      % End preprocessing for this new mappoint polygon
+   
+ 
+   % Find where intersect conditions fail (miss barrier, pass through gap) and
+   % prepare for replacement of those routes with direct distance.
+   % First take copy of r3 and g1 so that mods below will not clobber
+   % poly-generic values
+   r = r3;
+   g1xB = g1x;
+   g1yB = g1y;
+
+   if ~isempty(ichk)
+      nch = length(ichk);
+      if nch==1
+	 hit = iscross(squeeze(P_line(1,:,il))',squeeze(P_line(2,:,il))',...
+		    [xj; xv(ichk)],[yj; yv(ichk)]);
+      else
+	 hit = iscross(squeeze(P_line(1,:,il)),squeeze(P_line(2,:,il)),...
+		[repmat(xj,1,nch);xv(ichk)'],[repmat(yj,1,nch);yv(ichk)']);
+      end
+      jc = ichk(find(P_lgap(il)==hit));
+      if ~isempty(jc)
+	 r(1,jc) = zeros([1 length(jc)]);
+	 r(2,jc) = repmat(vlarge,[1 length(jc)]);
+	 g1xB(1,jc) = xv(jc)';
+	 g1yB(1,jc) = yv(jc)';
+      end
+   end
+
+   % The r calc takes a large part of the time of this function, and it is to
+   % reduce this time that we identify (above) and perform the calc on only 
+   % the valid routes (indexed by okr).
+   
+   r(okr) =  r(okr) + dk*sqrt(((g1xB(okr)-xj)*cor).^2 + (g1yB(okr)-yj).^2);
+
+   if any(chkrv(okr))
+      chkm = choke_mult(chkrv,okr,xj,yj,xv,yv);
+      r(okr) = r(okr).*chkm;
+   end
+      
+   rxy = minjd(r)';
+   
+   % Subset to only data within maximum allowed radius
+   Q = find(rxy<=rmax);
+
+   % For now, disable the "enough nearby data" test. It did seem to be of 
+   % value with t/s mapping, but would rather get a value everywhere possible
+   % with normal isobaric mapping.
+   % % Simple test for presence of enough local (within 250km) data 
+   % % Then can only proceed if still have enough data.   
+   % nnear = length(find(rxy(Q)<250));
+   % if nnear<3
+   %    Q = [];
+   %    nq(jj) = -1;
+   % elseif length(Q) < minq
+   
+   if length(Q) < minq
+      Q = [];
+   else
+      if bthy
+	 if depi(jj) <= 25
+	    rbath = rbshal(vis(Q));
+	 elseif depi(jj) >= 2000
+	    rbath = rbdeep(vis(Q));
+	 else
+	    btmp = depv(Q)';
+	    rbath = (1 - (maxjd([zeros(size(btmp)); 1-beta*(btmp./depi(jj))]) ...
+		     - maxjd([zeros(size(btmp)); 1-alpha*(btmp./depi(jj))]))').^2;
+	 end
+	 rbath = bthy*rbath;
+      else
+	 rbath = zeros(size(Q(:)));
+      end
+
+      if length(Q) > q2
+	 % More than enough data, so have to find which of it to use (using
+	 % an approximated bathy-combined (TAR) radius) Use minimum first guess
+         % initialising radius so that bathy and other-level weights will have
+	 % least effect.
+%
+%	 rtmp = rmin(jj)*sqrt((rxy(Q)/rmin(jj)).^2 + rbath + dwv(Q));
+%
+%	 [rq1,nQ] = varsort(rtmp,q1,q2,rmax,rmin(jj));
+%	 Q2 = find(rtmp<rq1);
+%
+%	 rq2 = maxjd(rxy(Q(Q2)));
+%	 if rq2 > 1.5*rmin(jj)
+%	    rtmp = rq2*sqrt((rxy(Q)/rq2).^2 + rbath + dwv(Q));	    
+%	    [rq1,nQ] = varsort(rtmp,q1,q2,rmax,rmin(jj));
+%	    Q2 = find(rtmp<rq1); 
+%	 end
+%	 Q = Q(Q2);
+
+         if q1 > 30
+	    [rq1,nQ] = varsort(rxy(Q),q1,q2,rmax,rmin(jj));
+	    rtmp = rq1*sqrt((rxy(Q)/rq1).^2 + rbath + dwv(Q));
+	    % If lots of downweighting, varsort returns a smaller sample
+	    % after creating combined radius. This is probably the opposite
+            % of what is best, so now use binsort with nQ based on the
+            % initial selection.  JRD 13/7/09	    
+	    % [rq1,nQ] = varsort(rtmp,q1,q2,rmax,rmin(jj));	 
+	    rq1 = binsort(rtmp,nQ);
+	 else
+	    % for small samples varsort is less suitable (and recently seems
+	    % to fall over) 
+	    rq1 = binsort(rxy(Q),q1);
+	    rtmp = rq1*sqrt((rxy(Q)/rq1).^2 + rbath + dwv(Q));
+	    rq1 = binsort(rtmp,q1);	 
+	 end
+	 
+	 % Maybe better to use as below, but stick with old method above
+	 % for now (in a test it showed less TAR & BAR induced structure in
+	 % rq fields, but not sure that is a bad thing???)
+	 %    rrmx = max([rmax max(rtmp)]);
+	 %    [rq1,nQ] = varsort(rtmp,q1,q2,rrmx,rmin(jj));
+
+	 Q2 = find(rtmp<rq1); 
+	 Q = Q(Q2);
+      else
+	 Q2 = 1:length(Q);
+      end
+   end
+
+   if length(Q) < minq
+      vo.nq(jj) = 0;
+   else      
+      % Count number of casts contributing a value at the mapping depth, then
+      % pack a bit more info in by using the fraction to store the ratio of
+      % mapping-level values to total values used (but this value is wrong if
+      % any external dw is applied.)
+      vo.nq(jj) = length(Q) + sum(dwv(Q)==0)/length(Q);
+      
+      % Get spatial radius normalising value and construct final radius
+      vo.rq(jj) = maxjd(rxy(Q));
+      r = sqrt((rxy(Q)./vo.rq(jj)).^2 + rbath(Q2) + dwv(Q));
+      
+      % Normalize combined-metric r and compute weights 
+      % NB: w=(1-r^3)^3  is recoded as below because ^3 is very slow in Matlab
+      r = r/maxjd(r);
+
+      % Faster form of (1-(r^3))^3      
+      w = 1-(r.^2.*r); w = (w.^2).*w;
+
+      % Avoid having too many points to invert (introduced Dec 05)
+      if vo.nq(jj) > 3*q1
+	 wmn = 1-binsort(1-w,3*q1);
+	 ij = find(w>wmn);
+	 w = w(ij);
+	 Q = Q(ij);
+	 r = r(ij);
+      end
+      
+      % Collect diagnostic data if requested
+      if grab_all
+ 	 xvq = xv(Q);
+	 yvq = yv(Q);
+	 dwq = dwv(Q);
+	 rbq = rbath(Q2);
+	 dq = ddv(Q);
+	 % tvq = t(vis(Q));
+	 bdvq = depv(Q);
+      end
+      d = ddv(Q);
+      x = (xv(Q)-xj).*latcor(yj);
+      y = yv(Q)-yj;
+
+      % Two more tests for inadequate data distribution:
+      % Introduced sum(w>.1)>3 in May 2004 as isopycnal mapping encountered
+      % "rank deficiency" where extremely poor data distrib.)
+      % Also tried sum(w)>.15  and  (maxwt/sumwt)<.5  but ensuring several
+      % points have non-trivial weight seems best policy.
+            
+      if noextrap>0
+	 px = x>0; 
+	 py = y>0;
+	 if (~any(px) | all(px) | ~any(py) | all(py))
+	    % data only on one side of grid point
+	    vo.nq(jj) = -4;
+	 elseif noextrap==3
+	    % The weight of data points is very imbalanced EW or NS.
+	    xbal = sum(w(px))./sum(w(~px));
+	    ybal = sum(w(py))./sum(w(~py));
+	    if xbal>40 | xbal<.025 | ybal>40 | ybal<.025 
+	       vo.nq(jj) = -5;
+	    end
+	 elseif noextrap==4
+	    % Sum weights in 16 "quadrants", then do a slightly
+            % centre-weighted sum of weight in each block of 9, and see if
+	    % any of these has very small weight. ie is ANY 1/2 of the
+            % ellipse nearly devoid of data (of non-trivial weight.)	    
+	    polang = atan2(y,x);
+	    for iip = 1:16
+	       pwgt(iip+4) = sum(w(polang>pinc(iip) & polang<=pinc(iip+1))); 
+	    end
+	    pwgt(1:4) = pwgt(17:20);
+	    pwgt(21:24) = pwgt(5:8);
+	    for iip = 1:16
+	       psm(iip) = sum(pwgt(4+iip+(-4:4)).*fwgt);
+	    end	    
+	    if any(psm<sum(w)./100)
+	       vo.nq(jj) = -6;
+	    end	 
+	 end
+      end
+      if wgtest & (sum(w>.01)<minq | sum(w>.1)<(minq/2))
+	 % not enough points have non-trivial weight
+	 vo.nq(jj) = -3;
+      end
+   end
+   
+   if vo.nq(jj) > 0
+      % Get sum of weights BEFORE adding bogus points
+      if smw
+	 vo.swgt(jj) = sum(w);      
+      end
+
+      % Form matrix A of data coordinates - first space coordinates, then
+      % optionally include annual and semi-annual harmonics in fit:
+      % 10/7/06 For isopycnal mapping, which runs out of data, reduce spatial
+      % fns for low nq calcs to minimise rank deficiency crashes. [used
+      % minq*2 until July 07, when changed to minq+15]
+      
+      Sij = Si;
+      if length(Q) > (minq+15)
+	 A = [ones(size(x)) x y x.*y x.^2 y.^2];
+      else
+	 A = [ones(size(x)) x y x.*y];
+	 if constrained
+	    Sij(5:6,:) = [];
+	    Sij(:,5:6) = [];	 
+	 end
+      end
+      if fns(1)
+	 anc = size(A,2) + [1 2];
+	 A = [A cst(vis(Q)) snt(vis(Q))];
+      end
+      if fns(2)
+	 sac = size(A,2) + [1 2];
+	 A = [A cs2t(vis(Q)) sn2t(vis(Q))];
+      end
+      if fns(3)
+	 t1c = size(A,2) + 1;
+	 A = [A Td(vis(Q))];  
+      end
+      if fns(4)
+	 t2c = size(A,2) + 1;
+	 A = [A Td2(vis(Q))];  
+      end
+	 
+      [ndata,ncoeff] = size(A);
+	 
+      % Bogus data method for constraining solutions where data is sparse:
+      % A bogus datum of a weighted mean (using a reduced radius so
+      % that the mean is as local as possible).
+      % The exponential weight fn goes to ~zero a small distance beyond rb
+      % (~1.5rb), so that points near the rb get some weight (~.18), but we
+      % don't have to actually find and exclude more distant points from the
+      % calculation.    
+	 
+      if bogus > 0
+	 if bogus<4 | ~(fns(1) | fns(2))
+	    rb = binsort(r,q1*near_rat);
+	    %  "wb = exp(-(1.2*r/rb).^3);"  recoded to remove the slow ^3
+	    wb = exp(-(1.2*r/rb).^2.*(1.2*r/rb));
+	 end
+	 
+	 if bogus >= 2 & (fns(1) | fns(2))
+	    % Temporal and Spatial bogusing
+	    A = [A; ones(12,1) zeros(12,ncoeff-1)];
+	    A(ndata+(1:12),anc) = [cos_tm sin_tm];
+	    if fns(2)
+	       A(ndata+(1:12),sac) = [cos_2tm sin_2tm];
+	    end
+	    if bogus >= 3
+	       % Stronger temporal: use mean of 10-day-weighted-means
+	       % instead of simple weighted mean.
+	       if bogus==3
+		  % Use bogusing weights, so still strong spatial 
+		  % bogusing
+		  W = wb;
+	       elseif bogus==4
+		  % Use loess weights, so more likely to get a better 
+		  % temporal average (over larger sample) but reduces
+		  % strength of spatial averaging. Potentially best removal
+		  % of seasonal sampling bias.
+		  W = w;
+	       end
+	       bog = 0;
+	       nbog = 0;
+	       tdq = td(vis(Q));
+	       for mm = 0:10:360
+		  mw = (tdq>mm & tdq<(mm+10));
+		  if any(mw) & sum(W(mw)) > 1e-4
+		     bog = bog + sum(d(mw).*W(mw))/sum(W(mw));
+		     nbog = nbog+1;
+		  end
+	       end
+	       bog = bog./nbog;
+	    else
+	       % Month partial bogus is just the weighted spatial mean,
+	       % so will not do much to reduce any seasonal sampling bias.
+	       bog = sum(d.*wb)/sum(wb);	       
+	    end
+	    d = [d; repmat(bog,12,1)];
+	    w = [w; repmat(.29,12,1)];
+	 else
+	    % Just spatial bogus
+	    bog = sum(d.*wb)/sum(wb);
+	    A = [A; 1 zeros(1,ncoeff-1)];
+	    d = [d; bog];
+	    w = [w; 1];
+	 end
+      elseif bogus<0
+	 % Use bogus value of 0, like doing OI with a background of 0
+	 % (presumably we are mapping an anomaly field.)
+	 % Options -2 and -3 simply ramp up the weight of this
+	 if bogus==-4
+	    % Split the bogus value into 12 monthly points, to temporal
+	    % as well as spatially constrain.
+	    A = [A; ones(12,1) zeros(12,ncoeff-1)];
+	    A(ndata+(1:12),anc) = [cos_tm sin_tm];
+	    if fns(2)
+	       A(ndata+(1:12),sac) = [cos_2tm sin_2tm];
+	    end
+	    d = [d; zeros(12,1)];
+	    w = [w; repmat(.29,12,1)];
+	 else
+	    % Different weights of drawing back to zero.
+	    A = [A; 1 zeros(1,ncoeff-1)];
+	    d = [d; 0];
+	    if bogus==-1
+	       w = [w; 1];
+	    elseif bogus==-2
+	       w = [w; max([1.5 vo.swgt(jj)./100])];
+	    elseif bogus==-3
+	       w = [w; max([2 vo.swgt(jj)./30])];
+	    end
+	 end
+      end
+      
+      if constrained
+	 % Constrained loess
+	 Wi = diag(w.^2);
+	 c = inv(A'*Wi*A+Sij)*A'*Wi*d;
+      else
+	 % Normal loess
+	 rhs = w.*d;
+	 
+	 %  "A = repmat(w,1,ncoeff).*A;" recoded to remove the slow repmat
+	 for jk=1:ncoeff
+	    A(:,jk) = w.*A(:,jk);
+	 end
+         
+	 % solve least-squares fit of A*c = d
+	 c = A\rhs;
+      end
+	 
+      % Extract fit coefficients, returning temporal harmonic fits as complex 
+      % amplitudes.
+	 
+      vo.mn(jj) = c(1);
+      if fns(1)
+	 vo.an(jj) = c(anc(1)) + i*c(anc(2));
+      end
+      if fns(2)
+	 vo.sa(jj) = c(sac(1)) + i*c(sac(2));
+      end
+      if fns(3)
+	 vo.tco(jj) = c(t1c);
+      end
+      if fns(4)
+	 vo.t2co(jj) = c(t2c);
+      end
+   end
+
+end
+
+% --------- End of loessbar -----------------------------
